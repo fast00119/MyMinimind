@@ -1,0 +1,22 @@
+[project]
+name = "myminimind"
+version = "0.1.0"
+description = "My implementation of MiniMind, a lightweight deep learning framework."
+readme = "README.md"
+authors = [
+    { name = "zouye", email = "568756862@qq.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3.4",
+    "pandas>=2.3.3",
+    "torch>=2.9.0",
+    "transformers>=4.57.1",
+]
+
+[project.scripts]
+myminimind = "myminimind:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
