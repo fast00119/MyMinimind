@@ -278,4 +278,31 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.down_proj(self.up_proj(x) * self.act_fn(self.gate_proj(x))))
 
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.layer_id = layer_id
+
+        self.attn = Attention(config)
+        self.mlp = FeedForward(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attn_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # GQA       
+        residual = hidden_states
+        hidden_states, present_key_value = self.attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+        hidden_states = hidden_states + residual
+
+        # FFN
+        hidden_states = hidden_states + self.mlp(self.post_attn_layernorm(hidden_states))
+        return hidden_states, present_key_value
+
+
 
