@@ -75,7 +75,7 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from transformers.activations import ACT2FN
 
 class RMSNorm(nn.Module):
@@ -278,13 +278,163 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.down_proj(self.up_proj(x) * self.act_fn(self.gate_proj(x))))
 
+class MoEGate(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.hidden_size = config.hidden_size
+        self.router = nn.Linear(self.hidden_size, self.n_routed_experts, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.router.weight, a = math.sqrt(5))
+
+    def forward(self, hidden_states):
+        """
+        Args:
+            x: [batch_size, seq_len, hidden_size]
+        Returns:
+            topk_idx: [batch_size*seq_len, topk]
+            topk_weight: [batch_size*seq_len, topk]
+            aux_loss: scalar
+        """
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        logits = self.router(hidden_states)
+
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=1, sorted=False)
+
+        if self.top_k>1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha>0.0:
+            scores_for_aux = scores
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            if self.seq_aux:
+                # 每个sequence单独计算专家负载，再在batch上取平均
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                ce.scatter_add_(
+                    dim=1,
+                    index=topk_idx_for_aux_loss,
+                    src=torch.ones(bsz, seq_len*self.top_k, device=hidden_states.device)
+                ).div_(seq_len * self.top_k / self.n_routed_experts)
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+            else:
+                # 把整个batch所有token放在一起统计专家负载
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                ce = mask_ce.float().mean(0)
+                pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
+    
+class MoEFeedFroward(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+
+        # 专家层
+        self.experts = nn.ModuleList([FeedForward(config) for _ in range(config.n_routed_experts)])
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+        # 门控层
+        self.gate = MoEGate(config)
+
+    def forward(self, x):
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        self.aux_loss = aux_loss
+        x = x.view(-1, h)
+        flat_topk_idx = topk_idx.view(-1)
+
+        if self.training:
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            y = torch.empty_like(x, dtype=x.dtype)
+
+            for i, expert in enumerate(self.experts):
+                expert_output = expert(x[flat_topk_idx == i])
+                if expert_output.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_output.to(y.dtype)
+                else:
+                    y[flat_topk_idx == i] = expert_output.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
+            # 加权求和，y表示每个token经过专家处理后的加权结果
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1)).view(
+                *orig_shape
+            )
+        # 计算共享专家输出
+        if self.config.n_shared_experts > 0:
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        """
+        Args:
+            x: [batch_size * seq_len, hidden_size]
+            flat_expert_indices: batch_size * seq_len * topk
+            flat_expert_weights: batch_size * seq_len * topk
+        Returns:
+            expert_cache: [batch_size * seq_len, hidden_size]
+        """
+        flat_expert_weights = flat_expert_weights.unsqueeze(-1)
+        expert_cache = torch.zeros_like(x)
+        idxs = flat_expert_indices.argsort()
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        token_idxs = idxs // self.config.num_experts_per_tok
+
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            expert = self.experts[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+        
+        return expert_cache
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.layer_id = layer_id
 
         self.attn = Attention(config)
-        self.mlp = FeedForward(config)
+        self.mlp = FeedForward(config) if not config.use_moe else MoEFeedFroward(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attn_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         
@@ -303,6 +453,4 @@ class MiniMindBlock(nn.Module):
         # FFN
         hidden_states = hidden_states + self.mlp(self.post_attn_layernorm(hidden_states))
         return hidden_states, present_key_value
-
-
 
