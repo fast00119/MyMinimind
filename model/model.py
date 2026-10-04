@@ -454,3 +454,74 @@ class MiniMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attn_layernorm(hidden_states))
         return hidden_states, present_key_value
 
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(idx, config) for idx in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        angles_cos, angles_sin = precompute_angles(
+            config.hidden_size // config.num_attention_heads,
+            config.max_position_embeddings,
+            config.rope_theta,
+            config.rope_scaling
+        )
+        self.register_buffer("angles_cos", angles_cos, persistent=True)
+        self.register_buffer("angles_sin", angles_sin, persistent=True)
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                **kwargs):
+        """
+        Args:
+            input_ids: [batch_size, seq_len]
+            attention_mask: [batch_size, seq_len]
+            past_key_values: 每层的kv cache列表 past_key_values[0] 形如(past_k, past_v)\
+            其中 past_k.shape = [bsz, past_seq_len, n_kv_heads, head_dim]
+            use_cache: 是否使用 kv cache
+        Returns:
+            hidden_states: [batch_size, seq_len, hidden_size]
+            presents: 更新后每层的kv cache
+            aux_loss: 所有层MoEFeedForward的aux_loss之和
+        """
+        bsz, seq_len = input_ids.shape
+
+        # 兼容性检查
+        if hasattr(past_key_values, 'layers'):
+                    past_key_values = None
+
+        past_key_values = past_key_values or [None] * len(self.layers)
+        # 计算start_pos: 已有past序列的长度
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeding = (
+            self.angles_cos[start_pos: start_pos+seq_len],
+            self.angles_sin[start_pos: start_pos+seq_len]
+        )
+
+        presents = []
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeding,
+                past_key_value,
+                use_cache,
+                attention_mask
+            )
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = sum(
+            layer.mlp.aux_loss for layer in self.layers if isinstance(layer.mlp,MoEFeedFroward)
+        )
+        return hidden_states, presents, aux_loss
+    
