@@ -1,5 +1,4 @@
-from transformers import PretrainedConfig
-
+from transformers import GenerationMixin, PreTrainedModel, PretrainedConfig
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -75,8 +74,9 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Union
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -525,3 +525,52 @@ class MiniMindModel(nn.Module):
         )
         return hidden_states, presents, aux_loss
     
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **args,
+    ):
+        hidden_states, presents, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+
+        # logits_to_keep: 若为int，则表示lm_head只对最后k个位置算logits（0表示全算），若为tensor，则表示按索引挑
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:,slice_indices,:])
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:,:-1,:].contiguous()
+            shift_labels = labels[:,1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.shape[-1]),
+                shift_labels.view(-1),
+                ignore_index=100
+            )
+
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+        output.aux_loss = aux_loss
+        return output
