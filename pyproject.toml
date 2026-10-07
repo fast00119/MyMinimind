@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "datasets>=5.1.0",
     "numpy>=2.3.4",
     "pandas>=2.3.3",
     "torch>=2.9.0",
@@ -20,3 +21,9 @@ myminimind = "myminimind:main"
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "ruff>=0.16.10",
+]
