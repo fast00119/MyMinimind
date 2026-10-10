@@ -80,8 +80,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
         self.eps = eps
-        self.weight = nn.parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x: torch.tensor):
         return torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps) * x
@@ -135,8 +136,8 @@ def precompute_angles(
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotary_half(x):
         return torch.cat([
-            -x[..., x.shape[-1]:],
-            x[..., :x.shape[-1]]
+            -x[..., x.shape[-1] // 2:],
+            x[..., :x.shape[-1] // 2]
         ], dim=-1)
 
     q_embed = q * cos.unsqueeze(unsqueeze_dim) + rotary_half(q) * sin.unsqueeze(unsqueeze_dim)
@@ -191,7 +192,7 @@ class Attention(nn.Module):
         self.dropout = args.dropout
 
         # 检查是否支持 Flash Attention
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
 
     def forward(self,
                 x: torch.Tensor,
@@ -236,28 +237,39 @@ class Attention(nn.Module):
 
         # 优先使用PyTorch 2.0+的scaled_dot_product_attention（Flash Attention实现）
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
-            attn_mask = None if attention_mask is None else attention_mask.view(bs, 1, 1, -1).expand(bs, self.n_local_heads, seq_len, -1).bool()
+            past_len = xk.size(-2) - seq_len
+            attn_mask = None
+
+            if past_len > 0:
+                query_positions = (
+                    torch.arange(seq_len, device=xq.device) + past_len
+                )
+                key_positions = torch.arange(xk.size(-2), device=xq.device)
+                attn_mask = (
+                    key_positions[None, :] <= query_positions[:, None]
+                )
             output = F.scaled_dot_product_attention(
                 xq, xk, xv,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True
-            )
+                is_causal=(past_len == 0),
+            )            
         else:
             scores = (xq @ xk.transpose(-2,-1)) / math.sqrt(self.head_dim)
 
-            causal_mask = torch.triu(torch.full((seq_len,seq_len), float("-inf")), diagonal=1)
-            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
+            causal_mask = torch.triu(torch.full((seq_len,seq_len), float("-inf"), device=scores.device), diagonal=1)
+            scores[:,:,:,-seq_len:] += causal_mask.unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores += extended_attention_mask
 
-        weight = torch.softmax(scores.float(), dim=-1).type_as(xq)
-        weight = self.attn_dropout(weight)
+            weight = torch.softmax(scores.float(), dim=-1).type_as(xq)
+            weight = self.attn_dropout(weight)
+            output = weight @ xv
 
-        output = self.o_proj((weight @ xv).transpose(1,2).reshape(bs, seq_len, -1))
+        output = self.o_proj(output.transpose(1,2).reshape(bs, seq_len, -1))
         output = self.resid_dropout(output)
 
         return output, past_kv
@@ -563,13 +575,13 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.shape[-1]),
                 shift_labels.view(-1),
-                ignore_index=100
+                ignore_index=-100
             )
 
         output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=past_key_values,
+            past_key_values=presents,
             hidden_states=hidden_states,
         )
         output.aux_loss = aux_loss

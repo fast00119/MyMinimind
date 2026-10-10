@@ -40,6 +40,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         wandb: 实验跟踪系统
     """
     start_time = time.time()
+    accumulated_batches = 0
+    save_pending = False    # 请求保存标记
 
     for step, (input_ids, labels, attention_mask) in enumerate(loader, start=start_step+1):
         input_ids = input_ids.to(args.device)
@@ -56,16 +58,23 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             loss = loss / args.accumulation_steps
         
         scaler.scale(loss).backward()
+        accumulated_batches += 1
 
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             # 先还原梯度的真实值，再进行梯度裁剪
             scaler.unscale_(optimizer)
+            # 尾组不足一个完整累积窗口时，恢复正确的平均梯度
+            if accumulated_batches < args.accumulation_steps:
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(args.accumulation_steps / accumulated_batches)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
 
             optimizer.zero_grad()
+            accumulated_batches = 0
 
         if (step % args.log_interval == 0 or step == iters) and is_main_process():
             spend_time = time.time() - start_time
@@ -80,31 +89,36 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             if wandb:
                 wandb.log({"loss": current_loss, "lr": current_lr, "epoch_left_time": eta_min})
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            moe_suffix = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
-            ckp_path = f"{args.save_dir}/{args.save_weight}_{args.hidden_size}{moe_suffix}.pth"
+        if step % args.save_interval == 0 or step == iters:
+            save_pending = True
+        # 等累积梯度清空再保存
+        if save_pending and accumulated_batches == 0:
+            if is_main_process():
+                moe_suffix = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
+                ckp_path = f"{args.save_dir}/{args.save_weight}_{args.hidden_size}{moe_suffix}.pth"
 
-            if isinstance(model, DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
+                if isinstance(model, DistributedDataParallel):
+                    state_dict = model.module.state_dict()
+                else:
+                    state_dict = model.state_dict()
 
-            # 保存模型权重到args.save_dir
-            state_dict = {k: v.half() for k, v in state_dict}
-            torch.save(state_dict, ckp_path)
+                # 保存模型权重到args.save_dir
+                state_dict = {k: v.half() for k, v in state_dict.items()}
+                torch.save(state_dict, ckp_path)
 
-            # 保存模型权重和完整训练状态到save_dir
-            lm_checkpoint(
-                lm_config=lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="../checkpoints"
-            )
+                # 保存模型权重和完整训练状态到save_dir
+                lm_checkpoint(
+                    lm_config=lm_config,
+                    weight=args.save_weight,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir="../checkpoints"
+                )
+            save_pending = False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
@@ -193,7 +207,7 @@ if __name__ == "__main__":
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data["model"])
-        optimizer.load_state_dict([ckp_data["optimizer"]])
+        optimizer.load_state_dict(ckp_data["optimizer"])
         scaler.load_state_dict(ckp_data["scaler"])
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
@@ -217,7 +231,7 @@ if __name__ == "__main__":
             loader = DataLoader(
                 train_ds,
                 batch_sampler=batch_sampler,
-                num_workers=args.num_works,
+                num_workers=args.num_workers,
                 pin_memory=True
             )
             Logger(

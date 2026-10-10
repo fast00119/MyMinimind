@@ -26,5 +26,5 @@ class PretrainDataset(Dataset):
         input_ids = torch.tensor(tokens, dtype=torch.long)
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
-        attention_mask = [input_ids != self.tokenizer.pad_token_id].long()
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         return input_ids, labels, attention_mask

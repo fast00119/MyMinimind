@@ -29,10 +29,6 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# 初始化分布式
-def init_distributed_mode():
-    pass
-
 # 保存或读取检查点，用于断点续训
 def lm_checkpoint(
     lm_config,
@@ -92,7 +88,7 @@ def lm_checkpoint(
                     resume_data[key] = value
 
         resume_tmp = resume_path + ".tmp"
-        torch.save(resume_data, resume_path)
+        torch.save(resume_data, resume_tmp)
         os.replace(resume_tmp, resume_path)
 
     else:
