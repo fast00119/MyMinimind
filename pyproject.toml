@@ -11,6 +11,7 @@ dependencies = [
     "datasets>=5.1.0",
     "numpy>=2.3.4",
     "pandas>=2.3.3",
+    "swanlab>=0.10.2",
     "torch>=2.9.0",
     "transformers>=4.57.1",
 ]
